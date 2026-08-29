@@ -1,0 +1,93 @@
+--[==[  MarkPresets  --  Saved Games\DCS\Config\MarkPresetsConfig.lua
+
+  Edit this file, then restart DCS. Presets appear only while you are in an
+  aircraft, never while spectating.
+
+  If something does not work, set logLevel = "info" below and read
+  Logs\MarkPresets.log. It prints the mission and server names as they load,
+  says which profile matched, and explains anything it skipped.
+
+
+  PROFILES  --  where a set of presets applies
+
+    mission        = "Op Bandit"      that mission and no other
+    missionPattern = "Bandit"         any mission with Bandit in its name
+    server         = "Blue Flag"      that server and no other
+    serverPattern  = "RotorHeads"     any server with RotorHeads in its name
+    missionPattern = "*"              everywhere
+
+  Give both a mission and a server and both must match. Give one and the other
+  is unconstrained, so serverPattern on its own covers every mission there.
+
+  The pattern forms match plain text anywhere in the name and ignore case, so
+  punctuation needs no special treatment. Lua patterns work too, if you know
+  them. Profiles are tried in order and the first match wins, so put specific
+  ones above general ones.
+
+
+  PRESETS
+
+    name          the button's label. Left out, it is taken from `text`.
+    text          what goes into the mark.
+    {|}           where the cursor lands, so you can click the button and
+                  start typing there. Never appears in the mark itself.
+    buttonColor   this button only.
+    autoCommit    this button only.
+
+  A section can set buttonColor and autoCommit for all of its presets, and a
+  profile for all of its sections. The nearest one wins.
+
+
+  TEXT ON MORE THAN ONE LINE
+
+  Either put \n where each break goes, inside ordinary quotes:
+
+      text = "First line\nSecond line",
+
+  or use double square brackets and press Enter where you want the breaks.
+  Everything between them is taken exactly as written, so the later lines have
+  to start at the left margin:
+
+      text = [[First line
+Second line]],
+
+  A mark holds about five lines of 33 characters. Longer text has crashed DCS,
+  so the log warns at startup about any preset that will not fit.
+]==]
+
+MarkPresets = {
+
+  fontSize    = 11,         -- 6 to 32
+  buttonColor = 0x1b1b1b,   -- 0xRRGGBB, no quotes, no alpha
+  autoCommit  = false,      -- true: send on click. false: send when you click away
+  compact     = false,      -- tighter padding and rows
+  layout      = "rows",     -- "rows", or "strip" for one wheel-scrolled line
+  logLevel    = "warn",     -- off, error, warn, info, debug
+
+  profiles = {
+    {
+      missionPattern = "*",
+      -- serverPattern = "RotorHeads",   -- and only on that server
+
+      sections = {
+        {
+          header = "Contacts",
+          presets = {
+            { name = "SAM",      text = "SA-6 site" },
+            { name = "Vehicles", text = "Vehicles: {|}" },
+            { text = "Troops in the open" },
+          },
+        },
+
+        {
+          header = "Status",
+          buttonColor = 0x203040,
+          presets = {
+            { name = "Clear",   text = "Area clear" },
+            { name = "SPOTTED", text = "SPOTTED", autoCommit = true },
+          },
+        },
+      },
+    },
+  },
+}

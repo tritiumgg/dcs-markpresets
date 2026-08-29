@@ -1,0 +1,180 @@
+name: Release
+
+# Bumps the version in the hook, builds the install archive, and publishes a
+# release whose notes come from the commits since the last tag.
+#
+# The repository tree already mirrors Saved Games\DCS, so building the archive is
+# zipping Scripts and Config as they stand. Nothing is generated or rewritten
+# except the version string.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+permissions:
+  contents: write
+
+# One release at a time. Two concurrent runs would both bump from the same base
+# and the second push would be rejected.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # The version bump is itself a push to main. Without this the workflow would
+    # trigger its own next run, forever.
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # tags, and the full log for the changelog
+
+      # DCS runs LuaJIT, which is Lua 5.1. A newer parser accepts syntax DCS
+      # rejects, so the check has to be this version to mean anything.
+      - name: Check the Lua parses under 5.1
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1 zip
+          luac5.1 -p Scripts/Hooks/MarkPresets.lua
+          luac5.1 -p Config/MarkPresetsConfig.lua.example
+
+      - name: Work out the next version
+        id: ver
+        run: |
+          set -euo pipefail
+          HOOK=Scripts/Hooks/MarkPresets.lua
+
+          CURRENT=$(grep -oP 'local VERSION\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$HOOK")
+          echo "current is $CURRENT"
+
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$LAST_TAG" ]; then RANGE="$LAST_TAG..HEAD"; else RANGE=""; fi
+          echo "last tag: ${LAST_TAG:-none}"
+
+          # Subjects only for the decision; the full body is needed for the
+          # BREAKING CHANGE footer.
+          SUBJECTS=$(git log --format='%s' $RANGE)
+          BODIES=$(git log --format='%B' $RANGE)
+
+          if [ -z "$SUBJECTS" ]; then
+            echo "no commits since $LAST_TAG, nothing to release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BUMP="${{ github.event.inputs.bump || 'auto' }}"
+          if [ "$BUMP" = "auto" ]; then
+            if printf '%s' "$BODIES" | grep -qE '^BREAKING CHANGE' \
+               || printf '%s' "$SUBJECTS" | grep -qE '^[a-z]+(\([^)]*\))?!:'; then
+              BUMP=major
+            elif printf '%s' "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then
+              BUMP=minor
+            else
+              BUMP=patch
+            fi
+          fi
+          echo "bump: $BUMP"
+
+          IFS=. read -r MA MI PA <<< "$CURRENT"
+          case "$BUMP" in
+            major) MA=$((MA+1)); MI=0; PA=0 ;;
+            minor) MI=$((MI+1)); PA=0 ;;
+            patch) PA=$((PA+1)) ;;
+          esac
+          NEXT="$MA.$MI.$PA"
+          echo "next is $NEXT"
+
+          {
+            echo "skip=false"
+            echo "current=$CURRENT"
+            echo "next=$NEXT"
+            echo "tag=v$NEXT"
+            echo "range=$RANGE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write the version into the hook
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          HOOK=Scripts/Hooks/MarkPresets.lua
+          sed -i "s/^local VERSION = \"${{ steps.ver.outputs.current }}\"$/local VERSION = \"${{ steps.ver.outputs.next }}\"/" "$HOOK"
+          grep -q "local VERSION = \"${{ steps.ver.outputs.next }}\"" "$HOOK"
+          luac5.1 -p "$HOOK"        # the edit must not have broken it
+
+      - name: Build the changelog
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          RANGE="${{ steps.ver.outputs.range }}"
+
+          section () {   # $1 heading, $2 pattern
+            local body
+            body=$(git log --no-merges --format='%s|%h' $RANGE \
+                   | grep -E "$2" \
+                   | sed -E 's/^[a-z]+(\([^)]*\))?!?: *//' \
+                   | awk -F'|' '{printf "- %s (%s)\n", $1, $2}')
+            if [ -n "$body" ]; then printf '### %s\n\n%s\n\n' "$1" "$body"; fi
+          }
+
+          {
+            section "Features"     '^feat(\([^)]*\))?!?:'
+            section "Fixes"        '^fix(\([^)]*\))?!?:'
+            section "Performance"  '^perf(\([^)]*\))?!?:'
+            section "Documentation" '^docs(\([^)]*\))?!?:'
+            OTHER=$(git log --no-merges --format='%s|%h' $RANGE \
+                    | grep -vE '^(feat|fix|perf|docs)(\([^)]*\))?!?:' \
+                    | awk -F'|' '{printf "- %s (%s)\n", $1, $2}')
+            if [ -n "$OTHER" ]; then printf '### Other\n\n%s\n\n' "$OTHER"; fi
+
+            printf '### Install\n\n'
+            printf 'Extract `MarkPresets.zip` into `Saved Games\\DCS`, then restart DCS.\n'
+            printf 'First install only: rename `Config\\MarkPresetsConfig.lua.example`,\n'
+            printf 'dropping the `.example`. Upgrades keep your existing config.\n'
+          } > CHANGELOG.md
+
+          cat CHANGELOG.md
+
+      - name: Build the install archive
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          # Paths inside the archive must be relative to Saved Games\DCS, so the
+          # zip is built from the repository root with no wrapper directory.
+          zip -r -X MarkPresets.zip Scripts Config
+          unzip -l MarkPresets.zip
+          # Every entry must land on an install path.
+          if unzip -Z1 MarkPresets.zip | grep -qvE '^(Scripts|Config)/'; then
+            echo "archive contains a path outside Scripts/ and Config/"
+            exit 1
+          fi
+
+      - name: Commit the bump and tag it
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Scripts/Hooks/MarkPresets.lua
+          git commit -m "chore(release): ${{ steps.ver.outputs.next }} [skip release]"
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "${{ steps.ver.outputs.tag }}"
+          git push origin HEAD:main --follow-tags
+
+      - name: Publish the release
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            MarkPresets.zip \
+            --title "MarkPresets ${{ steps.ver.outputs.next }}" \
+            --notes-file CHANGELOG.md
