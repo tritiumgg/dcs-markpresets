@@ -10,6 +10,15 @@ name: Release
 on:
   push:
     branches: [main]
+    # Only what ends up in the archive. A change to the workflow, the README or
+    # anything else in the repository does not alter what a user installs, so it
+    # must not publish a version whose zip is identical to the last one.
+    #
+    # A push that touches both a shipping file and one of these still releases,
+    # which is right: the shipping change is the reason.
+    paths:
+      - 'Scripts/**'
+      - 'Config/**'
   workflow_dispatch:
     inputs:
       bump:
@@ -30,8 +39,10 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # The version bump is itself a push to main. Without this the workflow would
-    # trigger its own next run, forever.
+    # The bump commit edits Scripts/Hooks/MarkPresets.lua, which the path filter
+    # above matches, so it would trigger the next run. This is what stops that,
+    # and the two are not redundant: the filter decides which pushes are worth a
+    # release, this decides that our own bump is not one of them.
     if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
 
     steps:
@@ -54,7 +65,13 @@ jobs:
           set -euo pipefail
           HOOK=Scripts/Hooks/MarkPresets.lua
 
-          CURRENT=$(grep -oP 'local VERSION\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$HOOK")
+          # The version in the hook is the single source of truth. Say so plainly
+          # if it is not there, rather than failing on a bare exit code.
+          CURRENT=$(grep -oP 'local VERSION\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$HOOK" || true)
+          if [ -z "$CURRENT" ]; then
+            echo "No 'local VERSION = \"x.y.z\"' line in $HOOK, so there is nothing to bump."
+            exit 1
+          fi
           echo "current is $CURRENT"
 
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
@@ -73,25 +90,35 @@ jobs:
           fi
 
           BUMP="${{ github.event.inputs.bump || 'auto' }}"
-          if [ "$BUMP" = "auto" ]; then
-            if printf '%s' "$BODIES" | grep -qE '^BREAKING CHANGE' \
-               || printf '%s' "$SUBJECTS" | grep -qE '^[a-z]+(\([^)]*\))?!:'; then
-              BUMP=major
-            elif printf '%s' "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then
-              BUMP=minor
-            else
-              BUMP=patch
-            fi
-          fi
-          echo "bump: $BUMP"
 
-          IFS=. read -r MA MI PA <<< "$CURRENT"
-          case "$BUMP" in
-            major) MA=$((MA+1)); MI=0; PA=0 ;;
-            minor) MI=$((MI+1)); PA=0 ;;
-            patch) PA=$((PA+1)) ;;
-          esac
-          NEXT="$MA.$MI.$PA"
+          if [ -z "$LAST_TAG" ] && [ "$BUMP" = "auto" ]; then
+            # First release: publish the version the file already carries rather
+            # than bumping past it, so the opening number is whatever you set it
+            # to and not one above. Every release after this bumps normally,
+            # because there is then a tag to bump from.
+            NEXT="$CURRENT"
+            echo "no tags yet, so releasing $CURRENT as it stands"
+          else
+            if [ "$BUMP" = "auto" ]; then
+              if printf '%s' "$BODIES" | grep -qE '^BREAKING CHANGE' \
+                 || printf '%s' "$SUBJECTS" | grep -qE '^[a-z]+(\([^)]*\))?!:'; then
+                BUMP=major
+              elif printf '%s' "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then
+                BUMP=minor
+              else
+                BUMP=patch
+              fi
+            fi
+            echo "bump: $BUMP"
+
+            IFS=. read -r MA MI PA <<< "$CURRENT"
+            case "$BUMP" in
+              major) MA=$((MA+1)); MI=0; PA=0 ;;
+              minor) MI=$((MI+1)); PA=0 ;;
+              patch) PA=$((PA+1)) ;;
+            esac
+            NEXT="$MA.$MI.$PA"
+          fi
           echo "next is $NEXT"
 
           {
@@ -117,12 +144,18 @@ jobs:
           set -euo pipefail
           RANGE="${{ steps.ver.outputs.range }}"
 
+          # grep exits 1 when a section has no matching commits, and under
+          # `pipefail` that fails the whole step. A release with no `feat:` in it
+          # is completely ordinary -- the first one has none of these -- so every
+          # pipeline here absorbs an empty result rather than treating it as an
+          # error. `|| true` sits inside the substitution so it applies to the
+          # pipeline's status, not to the assignment.
           section () {   # $1 heading, $2 pattern
             local body
             body=$(git log --no-merges --format='%s|%h' $RANGE \
                    | grep -E "$2" \
                    | sed -E 's/^[a-z]+(\([^)]*\))?!?: *//' \
-                   | awk -F'|' '{printf "- %s (%s)\n", $1, $2}')
+                   | awk -F'|' '{printf "- %s (%s)\n", $1, $2}' || true)
             if [ -n "$body" ]; then printf '### %s\n\n%s\n\n' "$1" "$body"; fi
           }
 
@@ -133,7 +166,7 @@ jobs:
             section "Documentation" '^docs(\([^)]*\))?!?:'
             OTHER=$(git log --no-merges --format='%s|%h' $RANGE \
                     | grep -vE '^(feat|fix|perf|docs)(\([^)]*\))?!?:' \
-                    | awk -F'|' '{printf "- %s (%s)\n", $1, $2}')
+                    | awk -F'|' '{printf "- %s (%s)\n", $1, $2}' || true)
             if [ -n "$OTHER" ]; then printf '### Other\n\n%s\n\n' "$OTHER"; fi
 
             printf '### Install\n\n'
@@ -165,9 +198,19 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Scripts/Hooks/MarkPresets.lua
-          git commit -m "chore(release): ${{ steps.ver.outputs.next }} [skip release]"
+
+          # On a first release the file already carries the version being
+          # published, so there is nothing to commit and `git commit` would fail.
+          # The tag is still what matters.
+          if git diff --cached --quiet; then
+            echo "the hook already reads ${{ steps.ver.outputs.next }}, tagging without a bump commit"
+          else
+            git commit -m "chore(release): ${{ steps.ver.outputs.next }} [skip release]"
+            git push origin HEAD:main
+          fi
+
           git tag -a "${{ steps.ver.outputs.tag }}" -m "${{ steps.ver.outputs.tag }}"
-          git push origin HEAD:main --follow-tags
+          git push origin "${{ steps.ver.outputs.tag }}"
 
       - name: Publish the release
         if: steps.ver.outputs.skip == 'false'

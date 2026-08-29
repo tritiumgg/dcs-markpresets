@@ -43,7 +43,7 @@ local ENABLED = true
 
 -- Lua 5.1 allows 200 locals per function and the main chunk is one, so every top-level
 -- `local` here counts against that. Overrunning it is a load-time error in dcs.log.
-local VERSION = "6.1.0"
+local VERSION = "0.1.0"
 
 -- No package.path mutation: the incoming path already carries .\Scripts\?.lua and
 -- .\Scripts\UI\?.lua, so require("tools") resolves. It is a global shared with DCS's
