@@ -57,6 +57,7 @@ MarkPresets = {
           presets = {
             { name = "SAM",      text = "SA-6 site" },
             { name = "Vehicles", text = "Vehicles: {|}" },   -- {|} = cursor lands here
+            { name = "Here",     text = "{coords} {elev}" }, -- the mark's position
           },
         },
       },
@@ -64,6 +65,13 @@ MarkPresets = {
   },
 }
 ```
+
+`{coords}` and `{elev}` insert the mark's position and ground elevation, in
+whatever format the F10 map's coordinate readout is showing. For a fixed format
+use `{coords_mgrs}`, `{coords_dms}`, `{coords_ddm}`, `{coords_precise}` or
+`{coords_metric}`, and
+`{elev_feet}` or `{elev_meters}`. They work for any mark, whoever placed it, and
+are as precise as the map's zoom allows.
 
 `missionPattern` and `serverPattern` match plain text anywhere in the name and
 ignore case, so punctuation needs no escaping. `missionPattern = "*"` matches

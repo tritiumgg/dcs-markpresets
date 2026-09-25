@@ -14,7 +14,12 @@
   Touches:
     Scripts\UI\F10View\MarkPanel.dlg      -- eMarkLable, sMarkId, bodyPanel,
                                              headePanel; skin colours
+    Scripts\UI\F10View\AwacsCameraDialogToolbar.dlg
+                                          -- staticCoordinates, the coordinate readout,
+                                             for the coordinate tokens
     dxgui                                 -- raw calls on DCS-owned widgets
+    gui_map                               -- map point under a mark, for the same
+    terrain                               -- formatting and elevation, for the same
     dxgui\bind\{Widget,Window,Panel}.lua  -- wrapper classes for our own widgets
     Scripts\tools.lua                     -- Tools.safeDoFile for config
 
@@ -149,6 +154,7 @@ end
 --   callback removal at mission end   WidgetRemoveCallback on a dialog whose mission
 --                                     is ending; the same call is clean elsewhere
 --   teardown           destroying our own widgets at mission end
+--   map point          the first gui_map call of the session on the F10 map widget
 local probeDisabled = {}
 
 -- Failure here means the tracking model is wrong, so the hook stops rather than
@@ -245,6 +251,28 @@ local MARK_CHARS_PER_LINE = 33
 -- autoCommit presets included, so no marker can reach a mark. A bare "|" would be a
 -- worse choice: it turns up in callsigns and hand-drawn tables.
 local CARET_TOKEN = "{|}"
+
+-- Replaced at write time with the mark's position or its ground elevation. With no
+-- `style` or `unit`, in whatever the F10 map's coordinate readout is showing; with
+-- one, in that regardless. A brace-word not listed here is left as written.
+local COORD_TOKENS = {
+  ["{coords}"]         = { elev = false },
+  ["{coords_mgrs}"]    = { elev = false, style = "mgrs" },
+  ["{coords_dms}"]     = { elev = false, style = "dms" },
+  ["{coords_ddm}"]     = { elev = false, style = "ddm" },
+  ["{coords_precise}"] = { elev = false, style = "precise" },
+  ["{coords_metric}"]  = { elev = false, style = "metric" },
+  ["{elev}"]           = { elev = true },
+  ["{elev_feet}"]      = { elev = true, unit = "ft" },
+  ["{elev_meters}"]    = { elev = true, unit = "m" },
+}
+
+-- Matches every candidate for the table above, and never CARET_TOKEN.
+local COORD_TOKEN_PATTERN = "{[%w_]+}"
+
+-- Stand-ins for the line estimate at load, before any mark exists. The longest
+-- position is precise lat/long, "N42-52-53.37 E41-06-23.64", at 25 characters.
+local COORD_SAMPLE, ELEV_SAMPLE = string.rep("0", 25), "-12345 ft"
 
 -- Past this between press and release the gesture was a pan, not a click. Stops a map
 -- drag that releases inside a dialog's text box being read as a click into it. Biased
@@ -463,6 +491,26 @@ local function validateSections(raw, where, inheritedColor, inheritedAuto)
           local body, caretAt, caretStrict = splitCaret(prst.text)
           local auto = inheritBool(prst.autoCommit, sectionAuto, what .. " autoCommit")
 
+          -- Coordinates exist only at write time and move the caret, so such a preset
+          -- keeps its raw text and is split again once they are filled in. The estimate
+          -- below uses stand-ins of the longest length they take.
+          local estimated = body:gsub(COORD_TOKEN_PATTERN, function(token)
+            local t = COORD_TOKENS[token]
+            if t then return t.elev and ELEV_SAMPLE or COORD_SAMPLE end
+          end)
+          local template = (estimated ~= body) and prst.text or nil
+
+          -- A brace-word that is no token is almost always a misspelt one.
+          for token in body:gmatch(COORD_TOKEN_PATTERN) do
+            if not COORD_TOKENS[token] then
+              logW("%s contains %s, which is not a coordinate token, so it is written " ..
+                "as it is. The tokens are {coords}, {coords_mgrs}, {coords_dms}, " ..
+                "{coords_ddm}, {coords_precise}, {coords_metric}, {elev}, {elev_feet} " ..
+                "and {elev_meters}.",
+                what, token)
+            end
+          end
+
           if caretAt and auto then
             logW("%s places the caret with %s but also sets autoCommit, which sends the " ..
               "mark immediately and leaves nothing to type into. The marker is removed " ..
@@ -471,12 +519,12 @@ local function validateSections(raw, where, inheritedColor, inheritedAuto)
 
           -- Kept, not refused: this is an estimate, and refusing on one would remove
           -- working buttons. Reported at load, where it can still be fixed.
-          local needed = displayLines(body)
+          local needed = displayLines(estimated)
           if needed > MARK_MAX_LINES then
             logW("%s needs about %d lines and the mark dialog shows %d. Long text has " ..
               "preceded a DCS crash -- shorten it, or split it across presets. " ..
               "(%d characters, wrapping at about %d to a line.)",
-              what, needed, MARK_MAX_LINES, charCount(body), MARK_CHARS_PER_LINE)
+              what, needed, MARK_MAX_LINES, charCount(estimated), MARK_CHARS_PER_LINE)
           end
 
           -- Flattened: a Button label containing "\n" renders as one clipped line in a
@@ -487,6 +535,7 @@ local function validateSections(raw, where, inheritedColor, inheritedAuto)
           presets[#presets + 1] = {
             name = name,
             text = body,
+            template = template,
             caretAt = (not auto) and caretAt or nil,
             caretStrict = caretStrict,
             buttonColor = inheritColor(prst.buttonColor, sectionColor,
@@ -1170,6 +1219,242 @@ local function acquireAt(cx, cy, seen, attempt)
   return edited, editedId, editedW
 end
 
+-- ============================================================ coordinates
+
+-- The F10 map is a gui_map widget -- the native module behind the Mission Editor's map
+-- -- so the module that converts an ME click converts an F10 one too. Loaded on first
+-- use: most presets never need it.
+--
+-- measured on 2.9.29.27468: require("gui_map") loads in this state, GetMapMode on the
+-- F10 map widget answered "altitude", and GetMapPoint at the screen centre returned
+-- the map camera, equal to Export.LoGetCameraPosition. GetMapPoint at a placing click
+-- returned the position the mark was stored at, to the decimetre.
+local guiMap = nil
+local guiMapTried = false
+
+-- measured: a mark dialog's window sits exactly 13px up and left of its mark's icon,
+-- whoever placed the mark and wherever it is on screen -- -13.0,-13.0 and -13.2,-13.5
+-- against the projected positions of two marks. So the dialog locates its own mark,
+-- to within half a pixel of map scale, with no click involved.
+local MARK_ICON_OFFSET = 13
+
+-- Screen fractions tried for a point on the map itself. The map fills the screen
+-- under everything else, so any point not covered by a dialog, our panel or the
+-- toolbar finds it.
+local MAP_PROBES = { {0.5, 0.5}, {0.25, 0.5}, {0.75, 0.5}, {0.5, 0.8}, {0.25, 0.8},
+                     {0.75, 0.8}, {0.5, 0.25} }
+
+-- Points on the toolbar's coordinate readout, panelTop.staticCoordinates in
+-- Scripts\UI\F10View\AwacsCameraDialogToolbar.dlg: 58,4 at 183x22 in a window anchored
+-- top left. Any point on the toolbar would do, since the name lookup searches its root.
+local READOUT_PROBES = { {150, 15}, {100, 15}, {200, 15} }
+
+-- True once the first gui_map call on a DCS widget has gone through the marker.
+local mapProven = false
+
+-- The F10 map widget, re-resolved on every use as any DCS-owned widget other than a
+-- mark dialog must be. The type check keeps GetMapMode to candidates; GetMapMode then
+-- confirms, and measured raising a Lua error rather than faulting on a ToggleButton
+-- and an EditBox.
+local function mapWidget()
+  for _, f in ipairs(MAP_PROBES) do
+    local x, y = math.floor(screenW * f[1]), math.floor(screenH * f[2])
+    local okF, w = pcall(dxgui.FindWidgetAtScreenPoint, x, y)
+    if okF and isHandle(w) and not isOurs(w) then
+      local okT, kind = pcall(dxgui.WidgetGetTypeName, w)
+      if okT and kind == "Widget" and pcall(guiMap.GetMapMode, w) then return w end
+    end
+  end
+  return nil
+end
+
+-- The world x, z of the tracked mark, or nil.
+local function markPoint()
+  if not guiMapTried then
+    guiMapTried = true
+    local ok, gm = pcall(require, "gui_map")
+    if ok and type(gm) == "table" and type(gm.GetMapPoint) == "function" then
+      guiMap = gm
+    else
+      logW("Could not load gui_map, so coordinate tokens will be left empty. (%s)",
+        tostring(gm))
+    end
+  end
+  if not guiMap or not tracked or not screenW then return nil end
+
+  local rx, ry = windowRect(tracked.root)
+  if not rx then return nil end
+  local sx, sy = rx + MARK_ICON_OFFSET, ry + MARK_ICON_OFFSET
+
+  local x, z
+  local function convert()
+    local map = mapWidget()
+    if not map then return end
+    local okS, wx, wy = pcall(dxgui.ScreenToWidget, map, sx, sy)
+    if not okS or type(wx) ~= "number" then return end
+    local okP, px, pz = pcall(guiMap.GetMapPoint, map, wx, wy)
+    if okP and type(px) == "number" and type(pz) == "number" then x, z = px, pz end
+  end
+
+  if mapProven then
+    convert()
+  else
+    if probe("map point", convert) == nil then return nil end
+    mapProven = true
+  end
+
+  if not x then
+    logW("Could not find the F10 map under the screen to convert mark %s's position. " ..
+      "(gui_map.GetMapPoint on the map widget.)", tostring(tracked.markId))
+  end
+  return x, z
+end
+
+-- The readout's text: "<position>, <elevation>", or nil.
+local function readoutText()
+  for _, pt in ipairs(READOUT_PROBES) do
+    local root = rootAt(pt[1], pt[2])
+    if root and not isOurs(root) then
+      local txt = textOf(findChild(root, "staticCoordinates"))
+      if txt and txt ~= "" then return txt end
+    end
+  end
+  return nil
+end
+
+-- measured: clicking the readout cycles five formats, as below. Each is told apart by
+-- its shape; anything else is shown as MGRS, the DCS default.
+--
+--   mgrs     37 T FH 74461 49541
+--   precise  N42-52-53.37 E41-06-23.64
+--   dms      42°52'53"N 41°06'23"E
+--   ddm      N42°52.889 E41°06.394
+--   metric   X-00218471 Z+00562666
+local function readoutStyle(pos)
+  if pos:match("^%d+ %a+ %a%a ") then return "mgrs" end
+  if pos:match("^X[+-]")          then return "metric" end
+  if pos:match("^[NS]%d+%-")      then return "precise" end
+  if pos:match("^[NS]%d+\194\176") then return "ddm" end
+  if pos:match("^%d+\194\176")    then return "dms" end
+  return "mgrs"
+end
+
+-- "N"/"S" or "E"/"W", and the magnitude.
+local function hemisphere(v, pos, neg)
+  if v < 0 then return neg, -v end
+  return pos, v
+end
+
+-- Whole degrees, and the rest in units of 1/`units` degree. Truncated, not rounded:
+-- measured against the readout, all three lat/long forms truncate -- over about 1,100
+-- samples each, truncation matched every one and rounding a quarter.
+local function degreesIn(a, units)
+  local t = math.floor(a * units)
+  local d = math.floor(t / units)
+  return d, t - d * units
+end
+
+-- One axis of each lat/long form: value, then the positive and negative hemisphere.
+local LATLON = {
+  precise = function(v, p, n)
+    local h, a = hemisphere(v, p, n)
+    local d, r = degreesIn(a, 360000)   -- hundredths of a second
+    local m = math.floor(r / 6000)
+    return string.format("%s%d-%02d-%05.2f", h, d, m, (r - m * 6000) / 100)
+  end,
+  dms = function(v, p, n)
+    local h, a = hemisphere(v, p, n)
+    local d, r = degreesIn(a, 3600)     -- seconds
+    local m = math.floor(r / 60)
+    return string.format("%d\194\176%02d'%02d\"%s", d, m, r - m * 60, h)
+  end,
+  ddm = function(v, p, n)
+    local h, a = hemisphere(v, p, n)
+    local d, r = degreesIn(a, 60000)    -- thousandths of a minute
+    return string.format("%s%d\194\176%06.3f", h, d, r / 1000)
+  end,
+}
+
+-- Nearest whole number, halves up. What the readout does for metric and elevation.
+local function round(v) return math.floor(v + 0.5) end
+
+-- Position of x, z in the readout's style, or nil.
+local function formatPosition(style, x, z)
+  if style == "metric" then
+    -- measured: rounded, where the lat/long forms truncate. Signed, eight digits.
+    local function axis(v)
+      local r = round(v)
+      return string.format("%s%08d", r < 0 and "-" or "+", math.abs(r))
+    end
+    return "X" .. axis(x) .. " Z" .. axis(z)
+  end
+
+  if LATLON[style] then
+    local ok, lat, lon = pcall(terrain.convertMetersToLatLon, x, z)
+    if not ok or type(lat) ~= "number" then return nil end
+    local fn = LATLON[style]
+    return fn(lat, "N", "S") .. " " .. fn(lon, "E", "W")
+  end
+
+  local ok, mgrs = pcall(terrain.GetMGRScoordinates, x, z)
+  return (ok and type(mgrs) == "string") and mgrs or nil
+end
+
+-- Ground elevation at x, z in `unit`, "ft" or "m", or nil.
+--
+-- measured: the readout is terrain height rounded, in the unit it shows. Over water it
+-- goes negative with the seabed, which GetHeight reports as 0 -- hence the seabed
+-- call, read the way me_statusbar reads it.
+local function formatElevation(unit, x, z)
+  local ok, alt, depth = pcall(terrain.GetSurfaceHeightWithSeabed, x, z)
+  if not ok or type(alt) ~= "number" then return nil end
+  if alt == 0 and type(depth) == "number" then alt = -depth end
+  if unit == "m" then return string.format("%d m", round(alt)) end
+  return string.format("%d ft", round(alt * 3.28084))
+end
+
+-- The preset's template with coordinates in, then split for the caret as at load.
+-- A token that cannot be filled is left empty, with the reason in the log.
+local function fillTemplate(template)
+  local x, z = nil, nil
+  if type(terrain) == "table" then x, z = markPoint() end
+  if not x then
+    logW("Could not work out where mark %s is, so its coordinate tokens are left empty.",
+      tostring(tracked and tracked.markId))
+  end
+
+  -- The readout's format, read once and only if a token follows it. Unreadable, it
+  -- is MGRS in feet.
+  local shownStyle, shownUnit
+  local function shown()
+    if not shownStyle then
+      local readout = readoutText() or ""
+      local pos, elev = readout:match("^(.-),%s*(.-)%s*$")
+      shownStyle = readoutStyle(pos or readout)
+      shownUnit  = (elev or ""):match("(%a+)$") == "m" and "m" or "ft"
+    end
+    return shownStyle, shownUnit
+  end
+
+  -- Returning nil from a gsub function keeps the match, which is what an unknown
+  -- brace-word wants. A function also means no "%" in a value is read as an escape.
+  local text = template:gsub(COORD_TOKEN_PATTERN, function(token)
+    local t = COORD_TOKENS[token]
+    if not t then return nil end
+    if not x then return "" end
+    local value
+    if t.elev then
+      value = formatElevation(t.unit or select(2, shown()), x, z)
+    else
+      value = formatPosition(t.style or (shown()), x, z)
+    end
+    logD("%s for mark %s at %.1f, %.1f: %s", token, tostring(tracked.markId), x, z,
+      tostring(value))
+    return value or ""
+  end)
+  return splitCaret(text)
+end
+
 -- ============================================================ skins
 
 local FALLBACK_SKINS = false
@@ -1825,6 +2110,12 @@ local function applyText(preset)
   local edit = tracked.edit
   local text, autoCommit = preset.text, preset.autoCommit
   local caretAt, caretStrict = preset.caretAt, preset.caretStrict
+
+  -- Filled before the focus, so nothing about the write order below changes.
+  if preset.template then
+    text, caretAt, caretStrict = fillTemplate(preset.template)
+    if autoCommit then caretAt = nil end
+  end
 
   -- A preset replaces the whole field, so this is the only record of what was there.
   logBoxText(edit, "Replacing %d character%s in the text box: %s")

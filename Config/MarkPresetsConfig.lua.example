@@ -31,8 +31,25 @@
     text          what goes into the mark.
     {|}           where the cursor lands, so you can click the button and
                   start typing there. Never appears in the mark itself.
+    {coords}      the mark's position, in the format the F10 map's
+                  coordinate readout is showing. Click the readout to
+                  change it.
+    {elev}        the ground elevation at the mark, in the readout's unit.
     buttonColor   this button only.
+
+  COORDINATES IN A FIXED FORMAT
+
+    {coords_mgrs}      37 T FH 74461 49541
+    {coords_dms}       42°52'53"N 41°06'23"E
+    {coords_ddm}       N42°52.889 E41°06.394
+    {coords_precise}   N42-52-53.37 E41-06-23.64
+    {coords_metric}    X-00218471 Z+00562666
+    {elev_feet}        91 ft
+    {elev_meters}      28 m
     autoCommit    this button only.
+
+  Coordinates are worked out from where the mark sits on screen, so they are
+  as precise as the map's zoom: about half a screen pixel.
 
   A section can set buttonColor and autoCommit for all of its presets, and a
   profile for all of its sections. The nearest one wins.
@@ -76,6 +93,7 @@ MarkPresets = {
             { name = "SAM",      text = "SA-6 site" },
             { name = "Vehicles", text = "Vehicles: {|}" },
             { text = "Troops in the open" },
+            { name = "Position", text = "{coords}\nElev {elev}\n{|}" },
           },
         },
 
