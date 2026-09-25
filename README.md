@@ -5,6 +5,8 @@ Preset text buttons under the F10 map's mark dialog in DCS World.
 Open a mark, click a button, and its text goes into the mark. Useful for the
 things you write over and over without typing them out mid-flight.
 
+![Preset buttons under an F10 map mark dialog](screenshots/0.png)
+
 Client-side and cosmetic. It reads the mark dialog and writes into its text box;
 it does not touch the mission, the server, or anything else's UI.
 
